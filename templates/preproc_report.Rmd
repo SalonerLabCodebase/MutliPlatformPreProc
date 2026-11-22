@@ -1,0 +1,318 @@
+---
+title: "Proteomics pre-processing: `r params$project_name`"
+date: "`r format(Sys.time(), '%Y-%m-%d %H:%M')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: kable
+params:
+  project_name: "MyProject"
+  platform: "SomaScan"           # SomaScan, OLink, NULISA
+  tissue: "CSF"                  # CSF, Plasma
+  expr_file: ""
+  traits_file: ""
+  output_root: ""
+  traits_id_col: ""              # "" = first column of the traits file
+  expr_id_col: ""                # "" = platform default (SampleId / SampleID / SampleName)
+  group_col: "Group"
+  ctl_value: "CTL"
+  blank_group: "remove"          # remove, case
+  age_col: ""
+  sex_col: ""
+  sex_male_value: ""
+  sex_female_value: ""
+  drop_qc_fail: TRUE
+  olink_npx: "raw"               # raw, PC
+  use_fixed_lod: FALSE
+  fixed_lod_file: ""
+  lod_cutoff: NA                 # NA = platform default (0.75; NULISA 0.50)
+  sn_crit: 0.3
+  outlier_sd: 3
+  outlier_distance_screen: FALSE
+  outlier_robust_crit: 6
+  plate_correct: FALSE
+  n_boot: 1000
+  n_cores: 1
+  seed: 8675309
+  winsor_k: 0.25
+  winsor_sd: 5
+  fixes_file: ""
+  functions_file: ""
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = TRUE, fig.width = 8, fig.height = 6.5)
+options(stringsAsFactors = FALSE)
+p <- params
+fn_file <- if (nzchar(p$functions_file)) p$functions_file else file.path(dirname(knitr::current_input(dir = TRUE)), "..", "R", "preproc_functions.R")
+source(fn_file, local = TRUE)
+for (pk in c("SomaDataIO", "WGCNA", "limma", "diptest", "mclust", "boot"))
+  if (!requireNamespace(pk, quietly = TRUE)) stop("Package '", pk, "' is not installed.")
+if (p$platform == "OLink") stopifnot(requireNamespace("arrow", quietly = TRUE))
+suppressPackageStartupMessages(WGCNA::disableWGCNAThreads())
+stopifnot(p$platform %in% c("SomaScan", "OLink", "NULISA"), p$tissue %in% c("CSF", "Plasma"))
+lod_cutoff <- suppressWarnings(as.numeric(p$lod_cutoff))
+if (length(lod_cutoff) != 1 || is.na(lod_cutoff)) lod_cutoff <- default_lod_cutoff(p$platform)
+stopifnot("lod_cutoff must be between 0 and 1" = lod_cutoff > 0 && lod_cutoff <= 1)
+npx_type <- if (p$platform == "OLink" && isTRUE(p$use_fixed_lod)) "PC" else p$olink_npx   # conflicts row 6
+notes <- character(0)
+```
+
+## Run settings
+
+```{r settings}
+settings <- data.frame(Setting = names(p), Value = vapply(p, function(x) paste(format(x), collapse = ", "), ""))
+settings <- settings[!settings$Setting %in% "functions_file", ]
+settings$Value[settings$Setting == "lod_cutoff"] <- sprintf("%.2f", lod_cutoff)
+if (p$platform == "OLink") settings$Value[settings$Setting == "olink_npx"] <- npx_type
+settings
+```
+
+## Load data
+
+```{r load}
+traits.raw <- read_traits(p$traits_file, p$traits_id_col)
+expr.raw <- read_expression_raw(p$expr_file, p$platform)
+fx <- apply_dataset_fixes(p$fixes_file, expr.raw, traits.raw, p$platform, p$tissue)
+expr.raw <- fx$expr.raw; traits.raw <- fx$traits.raw
+ds <- build_dataset(expr.raw, p$platform, p$expr_id_col, npx_type, p$drop_qc_fail)
+notes <- c(notes, ds$notes)
+run_dir <- make_run_dir(p$output_root, p$project_name, p$platform, p$tissue,
+                        panel = if (p$platform == "NULISA") ds$panel else NULL,
+                        npx_type = if (p$platform == "OLink") npx_type else NULL)
+qc_dir <- file.path(run_dir, "QC")
+lab <- well_type_labels(p$platform)
+wt  <- table(factor(ds$wells$well_type, levels = c("Sample", "Buffer", "Calibrator", "QC", "Other")))
+wt  <- wt[wt > 0]
+wt_names <- ifelse(names(wt) %in% names(lab), lab[names(wt)], names(wt))   # "Other" has no label; keep it as is
+cat(sprintf("Expression matrix: %d features x %d wells (%s)\n", nrow(ds$exprMat0), ncol(ds$exprMat0),
+            paste(wt_names, wt, sep = " = ", collapse = ", ")))
+cat(sprintf("Traits: %d rows, ID column '%s'\n", nrow(traits.raw), attr(traits.raw, "id_col")))
+cat("Output folder:", run_dir, "\n")
+if (p$platform == "NULISA" && !all(is.na(ds$matrix_type)) && !toupper(p$tissue) %in% toupper(ds$matrix_type))
+  warning("Tissue is set to ", p$tissue, " but the NULISA file says SampleMatrixType = ", paste(ds$matrix_type, collapse = ", "))
+```
+
+```{r fixes, results = "asis"}
+if (fx$applied) {
+  cat("### Dataset fixes applied\n\nThis script was run on the raw inputs before anything else:\n\n```r\n")
+  cat(readLines(p$fixes_file), sep = "\n")
+  cat("\n```\n")
+}
+```
+
+## Match samples to traits
+
+```{r match}
+ds <- match_samples_to_traits(ds, traits.raw, p$group_col, p$ctl_value, p$blank_group, p$drop_qc_fail)
+mr <- ds$match_report
+show_ids <- function(x) if (length(x)) paste(head(x, 50), collapse = ", ") else "none"
+cat("Samples in the expression file with no traits row (excluded):", length(mr$samples_not_in_traits), "\n ", show_ids(mr$samples_not_in_traits), "\n")
+cat("Traits rows with no sample in the expression file:", length(mr$traits_not_in_data), "\n ", show_ids(mr$traits_not_in_data), "\n")
+cat(sprintf("Samples with a blank '%s' (%s): %d\n  %s\n", p$group_col,
+            if (p$blank_group == "case") "labelled Case" else "removed", length(mr$blank_group), show_ids(mr$blank_group)))
+cat(sprintf("Samples failing platform sample QC (%s): %d\n  %s\n", if (isTRUE(p$drop_qc_fail)) "removed" else "kept",
+            length(mr$qc_fail_samples), show_ids(mr$qc_fail_samples)))
+study <- ds$wells$well_id[!is.na(ds$wells$pp_group)]
+print(table(`Pre-processing group` = ds$wells$pp_group, useNA = "no"))
+```
+
+```{r mds.raw, fig.cap = "MDS of all study samples and control wells (at most 20 wells per control type)."}
+qc_figure("MDS_raw_all_wells", function() plot_mds_wells(ds, paste(p$project_name, "- all wells")), qc_dir)
+```
+
+## Reference statistics, LOD and signal-to-noise
+
+```{r lod}
+ref <- compute_reference_stats(ds)
+fixed_lod <- NULL
+if (p$platform == "OLink" && isTRUE(p$use_fixed_lod)) fixed_lod <- load_olink_fixed_lod(expr.raw, p$fixed_lod_file, ds$featData)
+below_all <- below_lod_mask(ds, ref, study, isTRUE(p$use_fixed_lod), fixed_lod)
+cat(sprintf("Values below LOD in study samples: %.1f%%\n", 100 * mean(below_all)))
+if (p$platform == "SomaScan") cat(sprintf("SomaLogic S:N groups: S0 = %d, S1 = %d, S2 = %d, S3 = %d\n",
+                                          sum(ref$S0), sum(ref$S1), sum(ref$S2), sum(ref$S3)))
+sn_all <- if (p$platform != "NULISA") signal_to_noise(ds, ref, study) else NULL
+```
+
+```{r lod.fig, fig.cap = "Fraction of study samples below LOD, per feature."}
+qc_figure("fraction_below_LOD", function() {
+  hist(rowMeans(below_all), breaks = 50, main = "Fraction of samples below LOD per feature",
+       xlab = "Fraction below LOD", col = "grey70", border = "white")
+  abline(v = lod_cutoff, col = "red", lty = 2)
+}, qc_dir)
+```
+
+## Log2 abundance and sample outliers
+
+```{r neat}
+cleanDat.neat <- ds$exprMat0[, study, drop = FALSE]
+if (ds$scale == "linear") { cleanDat.neat[cleanDat.neat <= 0] <- NA; cleanDat.neat <- log2(cleanDat.neat) }
+numericMeta <- traits.raw[ds$wells$sample_id[match(study, ds$wells$well_id)], , drop = FALSE]
+rownames(numericMeta) <- study
+numericMeta$PreProcGroup <- ds$wells$pp_group[match(study, ds$wells$well_id)]
+numericMeta$PlateID.expr <- ds$wells$plate[match(study, ds$wells$well_id)]
+stopifnot(identical(rownames(numericMeta), colnames(cleanDat.neat)))
+cat(sprintf("cleanDat.neat: %d features x %d samples; %d missing values\n", nrow(cleanDat.neat), ncol(cleanDat.neat), sum(is.na(cleanDat.neat))))
+```
+
+```{r outliers}
+ol <- detect_outliers(cleanDat.neat, p$outlier_sd, isTRUE(p$outlier_distance_screen), p$outlier_robust_crit)
+outliers <- ol$outliers
+cat(sprintf("Outlier samples removed: %d\n", sum(outliers)))
+if (any(outliers)) print(ol$table[ol$table$outlier, , drop = FALSE], row.names = FALSE)
+post <- colnames(cleanDat.neat)[!outliers]
+cleanDat.neat.PostSampOut <- cleanDat.neat[, post, drop = FALSE]
+numericMeta.PostSampOut <- numericMeta[post, , drop = FALSE]
+```
+
+```{r outliers.fig, fig.cap = "Connectivity z-scores; samples below the dashed line are removed."}
+qc_figure("outlier_connectivity", function() {
+  plot(ol$table$z.connectivity, pch = 16, col = ifelse(ol$table$outlier, "red", "grey40"),
+       ylim = range(c(ol$table$z.connectivity, -p$outlier_sd - 0.5)),
+       ylab = "Connectivity z", xlab = "Sample", main = "Sample network connectivity")
+  abline(h = -p$outlier_sd, lty = 2, col = "red")
+}, qc_dir)
+```
+
+```{r mds.post, fig.cap = "MDS of study samples after outlier removal."}
+qc_figure("MDS_post_outlier", function() plot_mds_wells(ds, paste(p$project_name, "- after outlier removal"), samples = post), qc_dir)
+```
+
+## Bimodal features
+
+```{r bimodal}
+bimodal_tbl <- detect_bimodal(cleanDat.neat.PostSampOut)
+bimodal_features <- bimodal_tbl$Variable[bimodal_tbl$Bimodal]
+cat(sprintf("Bimodal features removed: %d of %d\n", length(bimodal_features), nrow(bimodal_tbl)))
+n_gmm_fail <- sum(is.na(bimodal_tbl$GMMComponents) & !is.na(bimodal_tbl$DipPValue))
+if (n_gmm_fail) warning(n_gmm_fail, " features: the mixture-model fit failed, so they were not tested for bimodality.")
+if (length(bimodal_features)) cat(" ", paste(head(bimodal_features, 100), collapse = ", "), "\n")
+cleanDat.base <- cleanDat.neat.PostSampOut[!rownames(cleanDat.neat.PostSampOut) %in% bimodal_features, , drop = FALSE]
+```
+
+```{r plate, eval = isTRUE(params$plate_correct)}
+cat("Plate regression (case/control protected)\n")
+before_plate <- cleanDat.base
+cleanDat.base <- regress_plate(cleanDat.base, numericMeta.PostSampOut$PlateID.expr, numericMeta.PostSampOut$PreProcGroup)
+qc_figure("MDS_plate_regression", function() {
+  op <- par(mfrow = c(1, 2)); on.exit(par(op))
+  pc <- as.integer(factor(numericMeta.PostSampOut$PlateID.expr))
+  limma::plotMDS(before_plate[complete.cases(before_plate), ], col = pc, pch = 16, main = "Before plate regression")
+  limma::plotMDS(cleanDat.base[complete.cases(cleanDat.base), ], col = pc, pch = 16, main = "After plate regression")
+}, qc_dir, width = 11, height = 6)
+```
+
+## Covariates
+
+```{r covariates}
+ctl <- post[numericMeta.PostSampOut$PreProcGroup == "CTL"]
+pc1 <- compute_pc1_scores(cleanDat.base, ctl)
+numericMeta.PostSampOut$PC1score <- pc1$scores[post]
+cat(sprintf("PC1 from %d control samples over %d features (%.1f%% of control variance)\n",
+            length(ctl), pc1$n_features, 100 * pc1$var_explained))
+covars <- data.frame(pc1score = pc1$scores[post], row.names = post)
+mandatory <- character(0)
+if (p$tissue == "CSF") {
+  bep <- blood_eigenprotein(cleanDat.base, ds$featData, bimodal_features)
+  r <- bep$report
+  cat("Blood markers used:", show_ids(r$markers_used), "\n")
+  cat("Blood markers removed earlier as bimodal:", show_ids(r$markers_removed_bimodal), "\n")
+  cat("Blood markers not measured:", show_ids(r$markers_absent), "\n")
+  if (is.null(bep$ep)) {
+    warning("Fewer than 2 blood markers available; no blood eigenprotein, so no Blood regression.")
+  } else {
+    numericMeta.PostSampOut$bloodEigenprotein <- bep$ep[post]
+    covars <- cbind(data.frame(bloodEP = bep$ep[post], row.names = post), covars)
+    mandatory <- "bloodEP"
+  }
+}
+if (nzchar(p$age_col)) covars$age <- suppressWarnings(as.numeric(numericMeta.PostSampOut[[p$age_col]]))
+if (nzchar(p$sex_col)) {
+  sx <- recode_sex(numericMeta.PostSampOut[[p$sex_col]], p$sex_male_value, p$sex_female_value)
+  covars$sex <- sx$sex
+  numericMeta.PostSampOut$sex.numeric <- sx$sex
+  cat(sx$note, "\n")
+}
+for (v in colnames(covars)) {
+  if (stats::sd(covars[ctl, v], na.rm = TRUE) %in% c(0, NA)) {
+    warning("Covariate '", v, "' does not vary among controls; dropped from the regression.")
+    covars[[v]] <- NULL; mandatory <- setdiff(mandatory, v)
+  }
+}
+cat("Covariates in the control-only regression:", paste(colnames(covars), collapse = ", "), "\n")
+```
+
+## Control-only bootstrap regression
+
+```{r regression}
+t0 <- Sys.time()
+coefmat <- fit_ctl_bootstrap(cleanDat.base, covars, ctl, n_boot = p$n_boot, seed = p$seed, n_cores = p$n_cores)
+cat(sprintf("Bootstrap regression: %d features, %d resamples, %.1f min\n", nrow(coefmat), p$n_boot,
+            as.numeric(difftime(Sys.time(), t0, units = "mins"))))
+cc <- center_covariates(covars)
+notes <- c(notes, cc$notes)
+regList <- c(list(cleanDat = cleanDat.base),
+             generate_regressed(cleanDat.base, coefmat, cc$centered, mandatory))
+cat("Matrices produced:", paste(names(regList), collapse = ", "), "\n")
+```
+
+```{r regression.fig, fig.height = 4}
+for (nm in setdiff(names(regList), "cleanDat")) {
+  cors <- vapply(seq_len(nrow(cleanDat.base)), function(i)
+    suppressWarnings(cor(cleanDat.base[i, ], regList[[nm]][i, ], use = "pairwise.complete.obs")), numeric(1))
+  qc_figure(paste0("correlation_", nm), function() hist(cors, breaks = 40, col = "steelblue", border = "white",
+       main = nm, xlab = "Per-feature r, before vs after regression"), qc_dir, height = 4)
+}
+```
+
+## Feature filters
+
+```{r filters}
+lod_res <- lod_filter(below_all[, post, drop = FALSE], lod_cutoff)
+keep1 <- intersect(rownames(cleanDat.base), lod_res$keep)
+cat(sprintf("1-pass (at most %.0f%% of samples below LOD): %d of %d features kept\n", 100 * lod_cutoff, length(keep1), nrow(cleanDat.base)))
+sn_res <- NULL; keep2 <- NULL
+if (p$platform != "NULISA") {
+  sn_res <- sn_filter(sn_all[, post, drop = FALSE], lod_cutoff, p$sn_crit)
+  keep2 <- intersect(keep1, sn_res$keep)
+  cat(sprintf("2-pass (also S:N below %.2f in at most %.0f%% of samples): %d features kept\n", p$sn_crit, 100 * lod_cutoff, length(keep2)))
+}
+outList <- list()
+for (nm in names(regList)) {
+  m <- regList[[nm]]
+  outList[[nm]] <- m
+  outList[[paste0(nm, ".1pass.filtered")]] <- m[keep1, , drop = FALSE]
+  if (!is.null(keep2)) outList[[paste0(nm, ".2pass.filtered")]] <- m[keep2, , drop = FALSE]
+}
+winsor <- lapply(outList, winsorize_matrix, k = p$winsor_k, n_sd = p$winsor_sd)
+names(winsor) <- paste0(names(outList), ".", p$winsor_sd, "SDWinsor")
+outList <- c(outList, winsor)
+```
+
+## Outputs
+
+```{r write}
+write_cleanDats(outList, run_dir, ds$featData)
+utils::write.csv(numericMeta.PostSampOut, file.path(run_dir, "-traits", "numericMeta.PostSampOut.csv"))
+invisible(file.copy(p$traits_file, file.path(run_dir, "-traits", paste0("input_", basename(p$traits_file))), overwrite = TRUE))   # copy, never move, the input
+utils::write.csv(ol$table, file.path(run_dir, "-pre-proc", "sample_outliers.csv"), row.names = FALSE)
+utils::write.csv(bimodal_tbl, file.path(run_dir, "-pre-proc", "bimodal_test.csv"), row.names = FALSE)
+utils::write.csv(coefmat, file.path(run_dir, "-pre-proc", "regression_coefficients.csv"))
+masterQC <- build_master_qc(ds, ref, bimodal_tbl, lod_res, sn_res, p$platform)
+utils::write.csv(masterQC, file.path(run_dir, "-pre-proc", "masterQC.csv"), row.names = FALSE)
+yaml::write_yaml(c(p[setdiff(names(p), "functions_file")], list(lod_cutoff_used = lod_cutoff, npx_type_used = npx_type)),
+                 file.path(run_dir, "run_parameters.yaml"))
+writeLines(capture.output(sessionInfo()), file.path(run_dir, "-pre-proc", "sessionInfo.txt"))
+cat(sprintf("%d cleanDat files written to %s (human proteins only)\n", length(outList), file.path(run_dir, "-cleanDat")))
+cat(sprintf("QC status: %s\n", paste(names(table(masterQC$`QC Status`)), table(masterQC$`QC Status`), sep = " = ", collapse = ", ")))
+```
+
+```{r notes, results = "asis"}
+if (length(notes)) cat("## Notes\n\n", paste0("- ", notes, collapse = "\n"), "\n")
+```
+
+```{r save.workspace}
+rm(expr.raw)   # the raw file can be very large and is already on disk
+save(list = ls(), file = file.path(run_dir, "-pre-proc", "final_workspace.RData"))
+```

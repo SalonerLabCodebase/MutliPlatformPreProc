@@ -1,0 +1,287 @@
+---
+title: "Post-harmonization pre-processing: `r params$project_name`"
+date: "`r format(Sys.time(), '%Y-%m-%d %H:%M')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: kable
+params:
+  project_name: "MyProject"
+  platform: "NULISA"             # SomaScan, OLink, NULISA (labels and folder name only)
+  tissue: "Plasma"               # CSF, Plasma (CSF adds the blood eigenprotein)
+  expr_file: ""                  # harmonized cleanDat CSV: features x samples
+  traits_file: ""                # numericMeta CSV
+  output_root: ""
+  traits_id_col: ""              # "" = first column (row names of a write.csv file)
+  matrix_scale: "log2"           # log2 (TAMPOR cleanRelAbun, NPQ, log2 RFU) or linear
+  group_col: "Group"
+  ctl_value: "CTL"
+  blank_group: "remove"          # remove, case
+  age_col: ""
+  sex_col: ""
+  sex_male_value: ""
+  sex_female_value: ""
+  batch_col: ""                  # for MDS colouring and the repeated-sample table
+  pair_col: ""                   # column shared by repeated measurements (e.g. PairID)
+  duplicate_mode: "keep_all"     # keep_all, keep_one, average
+  keep_batch: ""                 # batch whose measurement is kept (keep_one / average)
+  run_outliers: TRUE
+  outlier_sd: 3
+  outlier_distance_screen: FALSE
+  outlier_robust_crit: 6
+  test_bimodal: FALSE
+  max_missing: 0.5
+  n_boot: 1000
+  n_cores: 1
+  seed: 8675309
+  winsor_k: 0.25
+  winsor_sd: 5
+  fixes_file: ""
+  functions_file: ""
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = TRUE, fig.width = 8, fig.height = 6.5)
+options(stringsAsFactors = FALSE)
+p <- params
+fn_file <- if (nzchar(p$functions_file)) p$functions_file else file.path(dirname(knitr::current_input(dir = TRUE)), "..", "R", "preproc_functions.R")
+source(fn_file, local = TRUE)
+for (pk in c("WGCNA", "limma", "diptest", "mclust", "boot"))
+  if (!requireNamespace(pk, quietly = TRUE)) stop("Package '", pk, "' is not installed.")
+suppressPackageStartupMessages(WGCNA::disableWGCNAThreads())
+stopifnot(p$platform %in% c("SomaScan", "OLink", "NULISA"), p$tissue %in% c("CSF", "Plasma"),
+          p$duplicate_mode %in% c("keep_all", "keep_one", "average"))
+notes <- character(0)
+show_ids <- function(x) if (length(x)) paste(head(x, 50), collapse = ", ") else "none"
+```
+
+This run starts from a matrix that was already LOD-filtered and harmonized upstream,
+so the well, LOD and signal-to-noise steps of the single-cohort pipeline are skipped.
+
+## Run settings
+
+```{r settings}
+settings <- data.frame(Setting = names(p), Value = vapply(p, function(x) paste(format(x), collapse = ", "), ""))
+settings[!settings$Setting %in% "functions_file", ]
+```
+
+## Load data
+
+```{r load}
+traits.raw <- read_traits(p$traits_file, p$traits_id_col)
+hm <- read_harmonized_matrix(p$expr_file, p$matrix_scale)
+notes <- c(notes, hm$notes)
+fx <- apply_dataset_fixes(p$fixes_file, hm$mat, traits.raw, p$platform, p$tissue)
+cleanDat.in <- fx$expr.raw; traits.raw <- fx$traits.raw
+featData <- harmonized_featdata(rownames(cleanDat.in))
+run_dir <- make_run_dir(p$output_root, p$project_name, p$platform, p$tissue, panel = "harmonized")
+qc_dir <- file.path(run_dir, "QC")
+cat(sprintf("Harmonized matrix: %d features x %d samples; %d missing values; median %.2f (log2)\n",
+            nrow(cleanDat.in), ncol(cleanDat.in), sum(is.na(cleanDat.in)), stats::median(cleanDat.in, na.rm = TRUE)))
+cat(sprintf("numericMeta: %d rows, ID column '%s'\n", nrow(traits.raw), attr(traits.raw, "id_col")))
+cat("Output folder:", run_dir, "\n")
+```
+
+```{r fixes, results = "asis"}
+if (fx$applied) {
+  cat("### Dataset fixes applied\n\nThis script was run on the inputs before anything else (`expr.raw` is the harmonized matrix):\n\n```r\n")
+  cat(readLines(p$fixes_file), sep = "\n")
+  cat("\n```\n")
+}
+```
+
+## Match samples to numericMeta
+
+```{r match}
+mh <- match_harmonized(cleanDat.in, traits.raw, p$group_col, p$ctl_value, p$blank_group)
+mr <- mh$report
+cat("Matrix columns with no numericMeta row (excluded):", length(mr$samples_not_in_traits), "\n ", show_ids(mr$samples_not_in_traits), "\n")
+cat("numericMeta rows with no matrix column:", length(mr$traits_not_in_data), "\n ", show_ids(mr$traits_not_in_data), "\n")
+cat(sprintf("Samples with a blank '%s' (%s): %d\n  %s\n", p$group_col,
+            if (p$blank_group == "case") "labelled Case" else "removed", length(mr$blank_group), show_ids(mr$blank_group)))
+if (nzchar(p$batch_col)) print(table(Batch = mh$meta[[p$batch_col]], `Pre-processing group` = mh$meta$PreProcGroup)) else
+  print(table(`Pre-processing group` = mh$meta$PreProcGroup))
+```
+
+## Repeated samples
+
+```{r duplicates}
+dd <- resolve_duplicates(mh$mat, mh$meta, p$pair_col, p$duplicate_mode, p$batch_col, p$keep_batch, p$sex_col)
+notes <- c(notes, dd$notes)
+if (is.null(dd$pairs)) {
+  cat(if (nzchar(p$pair_col)) paste0("No repeated values in '", p$pair_col, "'.\n") else "No pair column chosen; every column is treated as a separate sample.\n")
+} else {
+  cat(sprintf("%d samples measured more than once (same '%s'). Handling: %s%s\n", nrow(dd$pairs), p$pair_col,
+              c(keep_all = "all measurements kept", keep_one = "one measurement kept per sample",
+                average = "measurements averaged")[[p$duplicate_mode]],
+              if (p$duplicate_mode != "keep_all") paste0(" (", p$keep_batch %||% "first", " preferred)") else ""))
+  cat(sprintf("Group disagrees between measurements: %d; sex disagrees: %d\n", sum(!dd$pairs$group_agrees), sum(!dd$pairs$sex_agrees)))
+  for (n in dd$notes) warning(n)
+  print(utils::head(dd$pairs[order(dd$pairs$group_agrees, dd$pairs$sex_agrees), ], 60), row.names = FALSE)
+}
+cleanDat.neat <- dd$mat
+numericMeta <- dd$meta
+stopifnot(identical(rownames(numericMeta), colnames(cleanDat.neat)))
+cat(sprintf("\ncleanDat.neat: %d features x %d samples\n", nrow(cleanDat.neat), ncol(cleanDat.neat)))
+```
+
+```{r mds.in, fig.cap = "MDS of the harmonized matrix, by group and by batch."}
+qc_figure("MDS_harmonized_input", function() {
+  op <- par(mfrow = c(1, if (nzchar(p$batch_col)) 2 else 1)); on.exit(par(op))
+  plot_mds_samples(cleanDat.neat, numericMeta, "PreProcGroup", "By group")
+  if (nzchar(p$batch_col)) plot_mds_samples(cleanDat.neat, numericMeta, p$batch_col, "By batch")
+}, qc_dir, width = if (nzchar(p$batch_col)) 12 else 8, height = 6)
+```
+
+## Sample outliers
+
+```{r outliers}
+if (isTRUE(p$run_outliers)) {
+  ol <- detect_outliers(cleanDat.neat, p$outlier_sd, isTRUE(p$outlier_distance_screen), p$outlier_robust_crit)
+  ol$table <- cbind(ol$table, numericMeta[ol$table$sample, intersect(c("PreProcGroup", p$batch_col), colnames(numericMeta)), drop = FALSE])
+  outliers <- ol$outliers
+  cat(sprintf("Outlier samples removed: %d\n", sum(outliers)))
+  if (any(outliers)) print(ol$table[ol$table$outlier, , drop = FALSE], row.names = FALSE)
+} else {
+  ol <- NULL
+  outliers <- setNames(rep(FALSE, ncol(cleanDat.neat)), colnames(cleanDat.neat))
+  cat("Sample outlier detection is off; every sample is kept.\n")
+}
+post <- colnames(cleanDat.neat)[!outliers]
+cleanDat.neat.PostSampOut <- cleanDat.neat[, post, drop = FALSE]
+numericMeta.PostSampOut <- numericMeta[post, , drop = FALSE]
+```
+
+```{r outliers.fig, eval = isTRUE(params$run_outliers), fig.cap = "Connectivity z-scores; samples below the dashed line are removed."}
+qc_figure("outlier_connectivity", function() {
+  plot(ol$table$z.connectivity, pch = 16, col = ifelse(ol$table$outlier, "red", "grey40"),
+       ylim = range(c(ol$table$z.connectivity, -p$outlier_sd - 0.5)),
+       ylab = "Connectivity z", xlab = "Sample", main = "Sample network connectivity")
+  abline(h = -p$outlier_sd, lty = 2, col = "red")
+}, qc_dir)
+```
+
+## Feature checks
+
+```{r features}
+miss_res <- missing_filter(cleanDat.neat.PostSampOut, p$max_missing)
+cat(sprintf("Features with more than %.0f%% of samples missing (removed): %d of %d\n", 100 * p$max_missing,
+            nrow(cleanDat.neat.PostSampOut) - length(miss_res$keep), nrow(cleanDat.neat.PostSampOut)))
+if (length(miss_res$keep) < nrow(cleanDat.neat.PostSampOut)) cat(" ", show_ids(setdiff(rownames(cleanDat.neat.PostSampOut), miss_res$keep)), "\n")
+bimodal_tbl <- NULL; bimodal_features <- character(0)
+if (isTRUE(p$test_bimodal)) {
+  bimodal_tbl <- detect_bimodal(cleanDat.neat.PostSampOut)
+  bimodal_features <- bimodal_tbl$Variable[bimodal_tbl$Bimodal]
+  cat(sprintf("Bimodal features removed: %d of %d\n  %s\n", length(bimodal_features), nrow(bimodal_tbl), show_ids(bimodal_features)))
+  n_gmm_fail <- sum(is.na(bimodal_tbl$GMMComponents) & !is.na(bimodal_tbl$DipPValue))
+  if (n_gmm_fail) warning(n_gmm_fail, " features: the mixture-model fit failed, so they were not tested for bimodality.")
+} else cat("Bimodality not re-tested (done before harmonization).\n")
+cleanDat.base <- cleanDat.neat.PostSampOut[setdiff(miss_res$keep, bimodal_features), , drop = FALSE]
+cat(sprintf("Features carried into regression: %d\n", nrow(cleanDat.base)))
+```
+
+```{r mds.post, fig.cap = "MDS after outlier removal and feature checks."}
+qc_figure("MDS_post_outlier", function() {
+  op <- par(mfrow = c(1, if (nzchar(p$batch_col)) 2 else 1)); on.exit(par(op))
+  plot_mds_samples(cleanDat.base, numericMeta.PostSampOut, "PreProcGroup", "By group")
+  if (nzchar(p$batch_col)) plot_mds_samples(cleanDat.base, numericMeta.PostSampOut, p$batch_col, "By batch")
+}, qc_dir, width = if (nzchar(p$batch_col)) 12 else 8, height = 6)
+```
+
+## Covariates
+
+```{r covariates}
+ctl <- post[numericMeta.PostSampOut$PreProcGroup == "CTL"]
+pc1 <- compute_pc1_scores(cleanDat.base, ctl)
+numericMeta.PostSampOut$PC1score <- pc1$scores[post]
+cat(sprintf("PC1 from %d control samples over %d features (%.1f%% of control variance)\n",
+            length(ctl), pc1$n_features, 100 * pc1$var_explained))
+covars <- data.frame(pc1score = pc1$scores[post], row.names = post)
+mandatory <- character(0)
+if (p$tissue == "CSF") {
+  bep <- blood_eigenprotein(cleanDat.base, featData, bimodal_features)
+  r <- bep$report
+  cat("Blood markers used:", show_ids(r$markers_used), "\n")
+  cat("Blood markers not in the matrix:", show_ids(r$markers_absent), "\n")
+  if (is.null(bep$ep)) {
+    warning("Fewer than 2 blood markers available; no blood eigenprotein, so no Blood regression.")
+  } else {
+    numericMeta.PostSampOut$bloodEigenprotein <- bep$ep[post]
+    covars <- cbind(data.frame(bloodEP = bep$ep[post], row.names = post), covars)
+    mandatory <- "bloodEP"
+  }
+}
+if (nzchar(p$age_col)) covars$age <- suppressWarnings(as.numeric(numericMeta.PostSampOut[[p$age_col]]))
+if (nzchar(p$sex_col)) {
+  sx <- recode_sex(numericMeta.PostSampOut[[p$sex_col]], p$sex_male_value, p$sex_female_value)
+  covars$sex <- sx$sex
+  numericMeta.PostSampOut$sex.numeric <- sx$sex
+  cat(sx$note, "\n")
+}
+for (v in colnames(covars)) {
+  if (stats::sd(covars[ctl, v], na.rm = TRUE) %in% c(0, NA)) {
+    warning("Covariate '", v, "' does not vary among controls; dropped from the regression.")
+    covars[[v]] <- NULL; mandatory <- setdiff(mandatory, v)
+  }
+}
+cat("Covariates in the control-only regression:", paste(colnames(covars), collapse = ", "), "\n")
+if (p$duplicate_mode == "keep_all" && !is.null(dd$pairs)) {
+  n_rep <- sum(vapply(strsplit(dd$pairs$samples, "; "), function(m) max(0, sum(m %in% ctl) - 1), numeric(1)))
+  if (n_rep) cat(sprintf("Note: %d control columns are repeat measurements of another control column, so those samples count more than once in the control fit.\n", n_rep))
+}
+```
+
+## Control-only bootstrap regression
+
+```{r regression}
+t0 <- Sys.time()
+coefmat <- fit_ctl_bootstrap(cleanDat.base, covars, ctl, n_boot = p$n_boot, seed = p$seed, n_cores = p$n_cores)
+cat(sprintf("Bootstrap regression: %d features, %d resamples, %.1f min\n", nrow(coefmat), p$n_boot,
+            as.numeric(difftime(Sys.time(), t0, units = "mins"))))
+cc <- center_covariates(covars)
+notes <- c(notes, cc$notes)
+regList <- c(list(cleanDat = cleanDat.base),
+             generate_regressed(cleanDat.base, coefmat, cc$centered, mandatory))
+cat("Matrices produced:", paste(names(regList), collapse = ", "), "\n")
+```
+
+```{r regression.fig, fig.height = 4}
+for (nm in setdiff(names(regList), "cleanDat")) {
+  cors <- vapply(seq_len(nrow(cleanDat.base)), function(i)
+    suppressWarnings(cor(cleanDat.base[i, ], regList[[nm]][i, ], use = "pairwise.complete.obs")), numeric(1))
+  qc_figure(paste0("correlation_", nm), function() hist(cors, breaks = 40, col = "steelblue", border = "white",
+       main = nm, xlab = "Per-feature r, before vs after regression"), qc_dir, height = 4)
+}
+```
+
+## Outputs
+
+```{r write}
+outList <- regList
+winsor <- lapply(outList, winsorize_matrix, k = p$winsor_k, n_sd = p$winsor_sd)
+names(winsor) <- paste0(names(outList), ".", p$winsor_sd, "SDWinsor")
+outList <- c(outList, winsor)
+write_cleanDats(outList, run_dir, featData)
+utils::write.csv(numericMeta.PostSampOut, file.path(run_dir, "-traits", "numericMeta.PostSampOut.csv"))
+invisible(file.copy(p$traits_file, file.path(run_dir, "-traits", paste0("input_", basename(p$traits_file))), overwrite = TRUE))
+if (!is.null(ol)) utils::write.csv(ol$table, file.path(run_dir, "-pre-proc", "sample_outliers.csv"), row.names = FALSE)
+if (!is.null(dd$pairs)) utils::write.csv(dd$pairs, file.path(run_dir, "-pre-proc", "repeated_samples.csv"), row.names = FALSE)
+if (!is.null(bimodal_tbl)) utils::write.csv(bimodal_tbl, file.path(run_dir, "-pre-proc", "bimodal_test.csv"), row.names = FALSE)
+utils::write.csv(coefmat, file.path(run_dir, "-pre-proc", "regression_coefficients.csv"))
+masterQC <- build_master_qc_harmonized(featData, cleanDat.neat.PostSampOut, numericMeta.PostSampOut, miss_res, bimodal_tbl)
+utils::write.csv(masterQC, file.path(run_dir, "-pre-proc", "masterQC.csv"), row.names = FALSE)
+yaml::write_yaml(c(list(input_mode = "harmonized"), p[setdiff(names(p), "functions_file")]), file.path(run_dir, "run_parameters.yaml"))
+writeLines(capture.output(sessionInfo()), file.path(run_dir, "-pre-proc", "sessionInfo.txt"))
+cat(sprintf("%d cleanDat files written to %s\n", length(outList), file.path(run_dir, "-cleanDat")))
+cat(sprintf("Final: %d features x %d samples (%s)\n", nrow(cleanDat.base), ncol(cleanDat.base),
+            paste(names(table(numericMeta.PostSampOut$PreProcGroup)), table(numericMeta.PostSampOut$PreProcGroup), sep = " = ", collapse = ", ")))
+```
+
+```{r notes, results = "asis"}
+if (length(notes)) cat("## Notes\n\n", paste0("- ", notes, collapse = "\n"), "\n")
+```
+
+```{r save.workspace}
+save(list = ls(), file = file.path(run_dir, "-pre-proc", "final_workspace.RData"))
+```
