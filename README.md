@@ -372,4 +372,4 @@ For example, a SomaScan CSF run with age and sex writes 9 regression variants ×
 
 ## Citation / contact
 
-Maintained by Joshua D. Downer, UCSF Memory and Aging Center.
+Maintained by Joshua D. Downer for the Saloner Lab, UCSF Memory and Aging Center.
